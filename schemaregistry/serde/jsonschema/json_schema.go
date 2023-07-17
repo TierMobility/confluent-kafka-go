@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/cache"
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
 	"github.com/invopop/jsonschema"
 	jsonschema2 "github.com/santhosh-tekuri/jsonschema/v5"
@@ -30,7 +31,8 @@ import (
 // Serializer represents a JSON Schema serializer
 type Serializer struct {
 	serde.BaseSerializer
-	validate bool
+	validate            bool
+	compiledSchemaCache cache.Cache
 }
 
 // Deserializer represents a JSON Schema deserializer
@@ -44,10 +46,17 @@ var _ serde.Deserializer = new(Deserializer)
 
 // NewSerializer creates a JSON serializer for generic objects
 func NewSerializer(client schemaregistry.Client, serdeType serde.Type, conf *SerializerConfig) (*Serializer, error) {
-	s := &Serializer{
-		validate: conf.EnableValidation,
+	cache, err := cache.NewLRUCache(10)
+	if err != nil {
+		return nil, err
 	}
-	err := s.ConfigureSerializer(client, serdeType, &conf.SerializerConfig)
+
+	s := &Serializer{
+		validate:            conf.EnableValidation,
+		compiledSchemaCache: cache,
+	}
+
+	err = s.ConfigureSerializer(client, serdeType, &conf.SerializerConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -84,17 +93,7 @@ func (s *Serializer) Serialize(topic string, msg interface{}) ([]byte, error) {
 			return nil, err
 		}
 
-		subject, err := s.SubjectNameStrategy(topic, s.SerdeType, info)
-		if err != nil {
-			return nil, err
-		}
-
-		registeredSchemaInfo, err := s.Client.GetBySubjectAndID(subject, id)
-		if err != nil {
-			return nil, err
-		}
-
-		jschema, err := toJSONSchema(s.Client, registeredSchemaInfo)
+		jschema, err := s.getJSONSchema(id, topic, info)
 		if err != nil {
 			return nil, err
 		}
@@ -108,6 +107,34 @@ func (s *Serializer) Serialize(topic string, msg interface{}) ([]byte, error) {
 		return nil, err
 	}
 	return payload, nil
+}
+
+func (s *Serializer) getJSONSchema(id int, topic string, info schemaregistry.SchemaInfo) (*jsonschema2.Schema, error) {
+	subject, err := s.SubjectNameStrategy(topic, s.SerdeType, info)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheKey := compiledSchemaCacheKey{
+		Subject: subject,
+		Id:      id,
+	}
+	if schema, ok := s.compiledSchemaCache.Get(cacheKey); ok {
+		return schema.(*jsonschema2.Schema), nil
+	}
+
+	registeredSchemaInfo, err := s.Client.GetBySubjectAndID(subject, id)
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := toJSONSchema(s.Client, registeredSchemaInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	s.compiledSchemaCache.Put(cacheKey, schema)
+	return schema, nil
 }
 
 // NewDeserializer creates a JSON deserializer for generic objects
@@ -209,4 +236,9 @@ func toJSONSchema(c schemaregistry.Client, schema schemaregistry.SchemaInfo) (*j
 		return nil, err
 	}
 	return compiler.Compile(url)
+}
+
+type compiledSchemaCacheKey struct {
+	Subject string
+	Id      int
 }
